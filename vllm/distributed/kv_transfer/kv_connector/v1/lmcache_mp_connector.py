@@ -106,6 +106,50 @@ def extract_world_size_and_kv_rank(
         return world_size // tp_size, rank // tp_size
 
 
+def build_lmcache_mp_server_url(vllm_config: VllmConfig) -> str:
+    assert vllm_config.kv_transfer_config is not None
+
+    kv_transfer_config = vllm_config.kv_transfer_config
+    transport = str(
+        kv_transfer_config.get_from_extra_config("lmcache.mp.transport", "tcp")
+    ).lower()
+    server_port = kv_transfer_config.get_from_extra_config("lmcache.mp.port", 5555)
+
+    if transport == "tcp":
+        server_host = str(
+            kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.host", "localhost"
+            )
+        )
+        if server_host.startswith("tcp://"):
+            return f"{server_host}:{server_port}"
+        if "://" in server_host:
+            raise ValueError(
+                "lmcache.mp.host should not include a non-tcp scheme when "
+                "lmcache.mp.transport is 'tcp'"
+            )
+        return f"tcp://{server_host}:{server_port}"
+
+    if transport == "ipc":
+        ipc_path = str(
+            kv_transfer_config.get_from_extra_config(
+                "lmcache.mp.ipc_path", f"/tmp/lmcache_mp_{server_port}.sock"
+            )
+        )
+        if ipc_path.startswith("ipc://"):
+            return ipc_path
+        if "://" in ipc_path:
+            raise ValueError(
+                "lmcache.mp.ipc_path should not include a non-ipc scheme"
+            )
+        return f"ipc://{ipc_path}"
+
+    raise ValueError(
+        "Unsupported lmcache.mp.transport: "
+        f"{transport}. Supported transports are 'tcp' and 'ipc'."
+    )
+
+
 def create_scheduler_adapter(
     server_url: str,
     zmq_context: zmq.Context,
@@ -465,8 +509,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
     The connector for LMCache multi-process mode.
 
     Extra configs (kv_transfer_config.extra_config):
+    - lmcache.mp.transport: the ZMQ transport for the LMCache server.
+      Choices are "tcp" and "ipc". Defaults to "tcp".
     - lmcache.mp.host: the host of the LMCache server.
     - lmcache.mp.port: the port of the LMCache server.
+    - lmcache.mp.ipc_path: the IPC socket path when lmcache.mp.transport is
+      "ipc". Defaults to /tmp/lmcache_mp_<port>.sock.
     - lmcache.mp.mq_timeout: timeout (seconds) for message queue requests.
     - lmcache.mp.heartbeat_interval: interval (seconds) between server
       heartbeat pings.
@@ -481,12 +529,6 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
 
         assert vllm_config.kv_transfer_config is not None
-        server_host = vllm_config.kv_transfer_config.get_from_extra_config(
-            "lmcache.mp.host", "tcp://localhost"
-        )
-        server_port = vllm_config.kv_transfer_config.get_from_extra_config(
-            "lmcache.mp.port", 5555
-        )
         mq_timeout = float(
             vllm_config.kv_transfer_config.get_from_extra_config(
                 "lmcache.mp.mq_timeout", 300.0
@@ -498,7 +540,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             )
         )
 
-        server_url = f"{server_host}:{server_port}"
+        server_url = build_lmcache_mp_server_url(vllm_config)
         zmq_context = zmq.Context.instance()
         if self.role == KVConnectorRole.SCHEDULER:
             self.scheduler_adapter = create_scheduler_adapter(
